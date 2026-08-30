@@ -1,0 +1,21 @@
+# --- Claude Code ---
+# Local settings hold secrets (e.g. CONTEXT7_API_KEY). Never commit.
+.claude/settings.local.json
+.claude/*.local.json
+
+# --- Terraform ---
+# Provider/module downloads and lock-agnostic dirs
+**/.terraform/*
+
+# State: may contain secrets in plaintext; use remote backend
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Variable files: commonly hold credentials
+*.tfvars
+*.tfvars.json
+
+# --- Secrets / env ---
+.env
+.env.*
