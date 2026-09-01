@@ -1,6 +1,12 @@
-# Per-service IAM. Roles are created inside the module so services never share
-# permissions - one service's task role cannot be used by another.
+# Per-service IAM.
+# Roles are created inside the module so services never share permissions -
+# one service's task role cannot be used by another.
 
+data "aws_caller_identity" "current" {}
+
+# Both roles are assumed by the same principal - ecs-tasks.amazonaws.com covers
+# the execution role and the task role alike. They differ in permissions, not in
+# who may assume them, so one document serves both.
 data "aws_iam_policy_document" "assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -8,6 +14,14 @@ data "aws_iam_policy_document" "assume_role" {
     principals {
       type        = "Service"
       identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+
+    # confused deputy protection: without this, an ECS task in any account
+    # could assume these roles if it learned the ARN
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 }
