@@ -22,3 +22,25 @@ module "proxy" {
   # the route to the IGW must exist before the first image pull
   depends_on = [aws_route_table_association.public]
 }
+
+# --- task permissions -------------------------------------------------------
+#
+# The task role is created inside the module; policies attach to it from here by name.
+# Keeping them at the call site means each service grants only what it needs,
+# instead of every service inheriting one shared policy.
+#
+# nginx calls no AWS API, so this stays commented out. Uncomment and edit when a service needs one.
+# Secrets injected through the task definition are fetched by the execution role, not the task role.
+
+# data "aws_iam_policy_document" "proxy_s3" {
+#   statement {
+#     actions = ["s3:GetObject"]
+#     resources = ["arn:aws:s3:::my-bucket/*"]
+#   }
+# }
+#
+# resource "aws_iam_role_policy" "proxy_s3" {
+#   name   = "s3-read"
+#   role   = module.proxy.task_role_name
+#   policy = data.aws_iam_policy_document.proxy_s3.json
+# }
