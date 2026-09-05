@@ -55,3 +55,8 @@ output "mongo_parameters_read_policy_arn" {
   description = "attach to a service execution role so it may fetch the mongodb parameters"
   value       = aws_iam_policy.mongo_parameters_read.arn
 }
+
+output "github_actions_role_arn" {
+  description = "role GitHub Actions assumes via OIDC; store as the AWS_OIDC_ROLE repository secret"
+  value       = aws_iam_role.github_actions.arn
+}

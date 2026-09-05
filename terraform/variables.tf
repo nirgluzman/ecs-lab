@@ -139,3 +139,34 @@ variable "app_desired_count" {
   type        = number
   default     = 0
 }
+
+# --- GitHub Actions (OIDC) --------------------------------------------------
+
+variable "github_repository" {
+  description = "repository allowed to assume the CI role, as owner/name"
+  type        = string
+  default     = "nirgluzman/ecs-lab"
+
+  validation {
+    condition     = can(regex("^[^/]+/[^/]+$", var.github_repository))
+    error_message = "github_repository must be owner/name"
+  }
+}
+
+variable "github_default_branch" {
+  description = "branch the workflow runs from; the ref the default trust subject pins"
+  type        = string
+  default     = "main"
+}
+
+variable "github_oidc_subjects" {
+  description = "override the trust policy sub patterns entirely, e.g. to allow tags or an environment"
+  type        = list(string)
+  default     = []
+}
+
+variable "github_oidc_provider_arn" {
+  description = "ARN of an existing GitHub OIDC provider in this account; null creates one"
+  type        = string
+  default     = null
+}

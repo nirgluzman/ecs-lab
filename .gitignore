@@ -12,6 +12,9 @@
 *.tfstate.*
 *.tfstate.backup
 
+# Output dumps: rebuildable from an apply, and may echo sensitive values
+terraform/outputs.json
+
 # Variable files: commonly hold credentials
 *.tfvars
 *.tfvars.json

@@ -9,6 +9,7 @@ Two top-level directories:
 ```
 terraform/   # the AWS infrastructure - VPC, ECS cluster, Fargate services
 services/    # the workload - the containers that run on it
+scripts/     # small operator helpers, e.g. publishing the CI role to GitHub
 ```
 
 ## Goals
@@ -36,6 +37,7 @@ terraform/
 ├── service-frontend.tf  # Streamlit, internet-facing
 ├── service-backend.tf   # FastAPI, internal
 ├── service-mongodb.tf   # MongoDB, internal
+├── github-oidc.tf       # GitHub Actions OIDC provider, CI role, push + deploy policies
 ├── outputs.tf           # VPC and subnet IDs, service names, registry and parameter ARNs
 └── modules/
     └── service/         # one Fargate service, instantiated once per microservice
@@ -81,8 +83,64 @@ Pulls need no repository policy: the per-service execution role already carries
 `AmazonECSTaskExecutionRolePolicy`, and in-account access is settled by that
 identity policy alone.
 
-**Building and pushing is not wired up yet** - the repositories exist, the
-pipeline that fills them comes later.
+Pushes from CI authenticate through the role in
+[CI credentials](#ci-credentials-github-actions-oidc); the workflow that
+builds and pushes comes next.
+
+### CI credentials (GitHub Actions OIDC)
+
+`github-oidc.tf` lets GitHub Actions push to ECR **without an access key in the
+repository**. The workflow asks GitHub for a short-lived OIDC token describing
+itself, STS validates it against the registered identity provider, and hands
+back credentials for `ecslab-github-actions`. The only value GitHub stores is
+the role ARN.
+
+Two conditions carry the whole trust boundary - without them any repository on
+GitHub could assume the role:
+
+| Claim | Condition | Value |
+| --- | --- | --- |
+| `aud` | StringEquals | `sts.amazonaws.com` |
+| `sub` | StringLike | `repo:<github_repository>:ref:refs/heads/<github_default_branch>` |
+
+Set `github_oidc_subjects` to replace that default entirely - to allow tags
+(`...:ref:refs/tags/*`) or a deployment environment. The role's inline policy
+grants layer upload and `PutImage` on this project's repositories only, plus
+`ecr:GetAuthorizationToken`, which has no resource to scope to.
+
+A second inline policy, `ecs-deploy`, covers the other half of the pipeline -
+register a new task definition revision, then point the service at it:
+
+| Statement | Actions | Scope |
+| --- | --- | --- |
+| `RegisterTaskDefinitions` | `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskDefinition`, `ecs:ListTaskDefinitions` | `*` - task definitions are account-level and support no resource-level permissions |
+| `PassTaskRoles` | `iam:PassRole` | the execution and task role of each application service, and only when `iam:PassedToService` is `ecs-tasks.amazonaws.com` |
+| `UpdateServices` | `ecs:UpdateService`, `ecs:DescribeServices` | the frontend, backend and mongodb service ARNs, conditioned on `ecs:cluster` |
+| `InspectCluster` | `ecs:DescribeClusters` | the one cluster |
+
+`PassRole` is where the teeth are. Registering a revision hands ECS the roles
+named in it, so a deployer with `iam:PassRole` on `*` can run a task as any
+role in the account - which is why the passable ARNs are enumerated. nginx is
+not in the list: it runs a public upstream image and is not part of the
+pipeline.
+
+No `thumbprint_list`: GitHub is one of the IdPs AWS validates against its own
+trusted root CAs, so a pinned fingerprint would be ignored and would rotate out
+from under the config. If the account already has a GitHub provider (one per
+URL, account-wide), pass its ARN as `github_oidc_provider_arn` instead of
+creating a second one.
+
+Publish the ARN to the repository after applying:
+
+```bash
+./scripts/set-github-oidc-secret.sh          # or pass owner/repo explicitly
+```
+
+That reads the `github_actions_role_arn` output, sets it as the
+**`AWS_OIDC_ROLE`** repository secret with `gh`, and dumps every root output to
+`terraform/outputs.json` - the registry host, cluster and service names the
+deploy workflow needs, in one place. That dump is gitignored: it is a
+rebuildable artifact of an apply, and outputs can carry sensitive values.
 
 ### Configuration and secrets
 
@@ -258,6 +316,7 @@ See `services/README.md` for the development loop and per-service detail.
 - Terraform
 - AWS CLI v2, with credentials configured (`aws login` or `aws configure`)
 - Docker with Compose (runs the local stack; builds and pushes images to ECR)
+- [GitHub CLI](https://cli.github.com/) (`gh auth login`), to publish the CI role ARN as a repository secret
 - [uv](https://docs.astral.sh/uv/) (only to run a Python service outside Docker)
 
 ## Usage
@@ -279,8 +338,10 @@ repositories - see [Running the application stack](#running-the-application-stac
 ## Conventions
 
 - State is local for now. Move to an S3 backend with native locking (`use_lockfile = true`) before sharing.
-- Secrets never land in the repo: `.env`, `*.tfvars`, `*.tfstate*` and `.claude/settings.local.json` are gitignored; `services/.env.example` and
+- Secrets never land in the repo: `.env`, `*.tfvars`, `*.tfstate*`,
+  `terraform/outputs.json` and `.claude/settings.local.json` are gitignored; `services/.env.example` and
   `terraform/secrets.auto.tfvars.example` are the committed templates.
+- The only value GitHub holds is the CI role ARN, as the `AWS_OIDC_ROLE` secret; every AWS credential in CI is minted per run by STS.
 - Shared infrastructure lives in the root; anything instantiated more than once
   becomes a module.
 - One service per `service-*.tf` file, so call sites group together in a listing.
