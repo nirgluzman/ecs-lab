@@ -1,6 +1,20 @@
-# ECS Lab
+# ECS Service Connect
 
-A personal sandbox where I experiment with [**Amazon ECS**](https://aws.amazon.com/ecs/) concepts - clusters, task definitions, services, capacity providers (Fargate; EC2 out of scope for now), networking, IAM roles, service discovery, autoscaling, and logging.
+**How one ECS service finds another when task IPs change on every deployment.**
+
+A working [**Amazon ECS**](https://aws.amazon.com/ecs/) Fargate lab built around
+**Service Connect**: Streamlit -> FastAPI -> MongoDB, wired by name rather than
+by address, plus a second namespace holding a standalone nginx that cannot see
+any of it. A client calls `backend:8000`; an Envoy sidecar injected by ECS
+resolves it against Cloud Map and keeps resolving it across a deployment that
+replaces every task behind the name.
+
+Service Connect is the subject. Everything else here - the VPC, the ECR
+repositories, Parameter Store, the OIDC CI role, the deploy workflow - is the
+scaffolding that makes the discovery story something you can apply, deploy and
+destroy rather than read about. Along the way the lab covers the surrounding ECS
+primitives: clusters, task definitions, services, Fargate, per-task security
+groups, IAM roles and logging.
 
 All infrastructure is provisioned with **Terraform**. Nothing is created by hand in the console, so every experiment is reproducible and disposable.
 
@@ -15,7 +29,12 @@ scripts/     # small operator helpers - CI role, service endpoints
 
 ## Goals
 
-- Build ECS primitives from scratch, one layer at a time, and see how they interact.
+- Get Service Connect right end to end: namespaces as a discovery boundary,
+  client aliases, client-only membership, and what the injected proxy costs.
+- Understand why it is the better default here than ECS Service Discovery, which
+  hands clients task IPs over real DNS and lets a cached record outlive the task.
+- Show that discovery is not authorization - security groups still do that work.
+- Build the surrounding ECS primitives from scratch, one layer at a time.
 - Keep each experiment cheap and tear-down-able (`terraform destroy` leaves no residue).
 - Use the console only to observe, never to configure.
 
@@ -33,7 +52,7 @@ terraform/
 ├── cluster.tf           # the shared ECS cluster
 ├── ecr.tf               # one private image repository per service
 ├── ssm.tf               # service configuration and credentials in Parameter Store
-├── namespaces.tf        # two Cloud Map namespaces for Service Connect
+├── namespaces.tf        # two Cloud Map namespaces - the Service Connect boundary
 ├── service-nginx.tf     # nginx at the edge - a standalone experiment
 ├── service-frontend.tf  # Streamlit, internet-facing
 ├── service-backend.tf   # FastAPI, internal
@@ -43,7 +62,7 @@ terraform/
 └── modules/
     └── service/         # one Fargate service, instantiated once per microservice
         ├── versions.tf
-        ├── variables.tf # the interface - image, port, secrets, discovery, sizing, exposure
+        ├── variables.tf # the interface - image, port, secrets, Service Connect, sizing, exposure
         ├── main.tf      # log group, security group, task definition, service, Service Connect
         ├── iam.tf       # per-service execution and task roles
         └── outputs.tf   # security group ID, service and role ARNs, log group, task definition
@@ -59,8 +78,92 @@ directly on their own public IP.
 **Why a `service` module:** the goal is several microservices sharing one VPC and
 one cluster. Each has the same shape - task definition, log group, security group,
 its own IAM roles - and differs only in image, port, sizing, exposure, secrets,
-health check and discovery. The VPC, the cluster and the namespaces stay in the root because
+health check and Service Connect membership. The VPC, the cluster and the
+namespaces stay in the root because
 each exists exactly once.
+
+### Service Connect
+
+This is what the lab is for. `namespaces.tf` creates two Cloud Map **HTTP**
+namespaces, and `cluster.tf` still creates exactly one cluster. **A namespace is
+a discovery boundary, not a placement boundary** - all four services run in the
+same cluster, on the same subnets, but a service can only resolve names inside
+its own namespace:
+
+```
+ecslab-fargate  (one cluster)
+├── ecslab-nginx namespace   nginx
+└── ecslab-app   namespace   frontend -> backend -> mongodb
+```
+
+nginx is the standalone edge experiment and sits alone in `ecslab-nginx`, so it
+cannot see the application stack even though it shares every piece of
+infrastructure with it.
+
+Inside `ecslab-app`, ECS injects an Envoy sidecar into every task, and a client
+connects to `backend:8000` or `mongodb:27017` rather than to a task IP that
+changes on every deployment. HTTP namespaces, not private DNS ones - the sidecar
+resolves the names out of Cloud Map, so there is no hosted zone to pay for or
+clean up and the names exist only inside the mesh.
+
+**Why not ECS Service Discovery**, the older feature: it registers task IPs as
+real DNS records and hands them straight to the client, so a client that cached
+a record keeps dialling a task that no longer exists, and the namespace has to
+be a private DNS one backed by a Route 53 hosted zone. Service Connect keeps the
+resolution in the sidecar, which is also where it can retry and report per-request
+metrics. Nothing in `terraform/` uses `service_registries`.
+
+Two knobs on the module control membership:
+
+- `namespace_arn` - which namespace to join, `null` to opt out entirely.
+- `discoverable` - register a client alias others can call. The frontend is
+  `false`: it joins as a *client*, which is what lets it resolve `backend`, but
+  nothing calls it by name. Registering one would put a dead listener in every
+  task in the namespace.
+
+**Discovery is not authorization.** Security groups are unchanged by any of
+this. The sidecar still connects to the target ENI on the container port, so
+mongodb admits the backend's security group and the backend admits the
+frontend's - identity, not IP addresses. Those are passed as a **map** keyed by
+a caller-chosen label, not a list: `for_each` keys must be known at plan time
+and a security group ID is not. MongoDB stays on plain TCP; the backend declares
+`app_protocol = "http"`.
+
+The proxy is not free. It is a second container drawing on the same task-level
+`cpu` and `memory`, and AWS asks for 256 extra CPU units and at least 64 MiB to
+cover it - so every service in a namespace is sized 512/1024 rather than
+the module's 256/512 default.
+
+**Adding a service:** copy `service-nginx.tf` to `service-<name>.tf`. Internal
+services stay off the internet and name who may reach them:
+
+```hcl
+module "worker" {
+  source = "./modules/service"
+
+  name   = "worker"
+  image  = "..."
+  public = false
+
+  # join the namespace and register "worker" for others to call. The provider
+  # spells every Cloud Map resource aws_service_discovery_* - that is the
+  # registry's name, not the older ECS Service Discovery feature.
+  namespace_arn = aws_service_discovery_http_namespace.app.arn
+  discoverable  = true
+
+  # tracks the backend's tasks as their IPs churn. A map, not a list: for_each
+  # keys must be known at plan time, and a security group ID is not.
+  allowed_security_groups = { backend = module.backend.security_group_id }
+}
+```
+
+**If CI is to deploy it, add it to `local.github_deploy_modules` in
+`github-oidc.tf` as well** (see
+[CI credentials](#ci-credentials-github-actions-oidc)). That list is what the `ecs-deploy` policy is built
+from, so a service missing from it has no `iam:PassRole` on its execution and
+task roles - and the first deploy fails with `AccessDenied` on
+`iam:PassRole` while calling `RegisterTaskDefinition`, which is a confusing
+pair to read: the action named in the error is not the action that was denied.
 
 ### Image registry
 
@@ -110,7 +213,7 @@ GitHub could assume the role:
 owner and the repository:
 
 ```
-repo:nirgluzman@110996563/ecs-lab@1351712645:ref:refs/heads/main
+repo:nirgluzman@110996563/ecs-service-connect@1351712645:ref:refs/heads/main
 ```
 
 A policy pinning the plain name matches nothing in that format, and STS reports
@@ -273,8 +376,10 @@ and the action then omits the field entirely, leaving the running count alone.
 
 ### Finding a running service
 
-There is no load balancer and no DNS, so a task is reached on the public IP it
-happens to hold - which changes every time it is replaced. Rather than digging
+There is no load balancer and no public DNS name, so a task is reached on the
+public IP it happens to hold - which changes every time it is replaced. The
+Service Connect aliases (`backend:8000`, `mongodb:27017`) resolve only inside
+their namespace, so they are no help from a laptop. Rather than digging
 through the console:
 
 ```bash
@@ -374,74 +479,6 @@ not keep. Bump `mongo_secret_version` to push a changed password.
 Fetching these is the **execution role's** job, not the task role's - it reads
 them before the container starts. `ssm.tf` creates the read policy for that;
 attach it to a service with the module's `execution_role_name` output.
-
-### Namespaces
-
-`namespaces.tf` creates two Cloud Map HTTP namespaces, and `cluster.tf` still
-creates exactly one cluster. **A namespace is a discovery boundary, not a
-placement boundary** - all four services run in the same cluster, on the same
-subnets, but a service can only resolve names inside its own namespace:
-
-```
-ecslab-fargate  (one cluster)
-├── ecslab-nginx namespace   nginx
-└── ecslab-app   namespace   frontend -> backend -> mongodb
-```
-
-nginx is the standalone edge experiment and sits alone in `ecslab-nginx`, so it
-cannot see the application stack even though it shares every piece of
-infrastructure with it.
-
-Inside `ecslab-app`, discovery is **Service Connect**: ECS injects an Envoy
-sidecar, and a client connects to `backend:8000` or `mongodb:27017` rather than
-to a task IP that changes on every deployment. HTTP namespaces, not private DNS
-ones - the names are resolved by the sidecar, so there is no hosted zone to pay
-for or clean up. Two knobs on the module control it:
-
-- `namespace_arn` - which namespace to join, `null` to opt out entirely.
-- `discoverable` - register a name others can call. The frontend is `false`: it
-  joins as a *client*, which is what lets it resolve `backend`, but nothing
-  calls it by name.
-
-Security groups are unchanged by any of this. The sidecar still connects to the
-target ENI on the container port, so mongodb admits the backend's security
-group and the backend admits the frontend's - identity, not IP addresses. Those
-are passed as a **map** keyed by a caller-chosen label, not a list: `for_each`
-keys must be known at plan time and a security group ID is not.
-MongoDB stays on plain TCP; the backend declares `app_protocol = "http"`.
-
-The proxy is not free. It is a second container drawing on the same task-level
-`cpu` and `memory`, and AWS asks for 256 extra CPU units and at least 64 MiB to
-cover it - so every service in a namespace is sized 512/1024 rather than
-the module's 256/512 default.
-
-**Adding a service:** copy `service-nginx.tf` to `service-<name>.tf`. Internal
-services stay off the internet and name who may reach them:
-
-```hcl
-module "worker" {
-  source = "./modules/service"
-
-  name   = "worker"
-  image  = "..."
-  public = false
-
-  # join the namespace and register "worker" for others to call
-  namespace_arn = aws_service_discovery_http_namespace.app.arn
-  discoverable  = true
-
-  # tracks the backend's tasks as their IPs churn. A map, not a list: for_each
-  # keys must be known at plan time, and a security group ID is not.
-  allowed_security_groups = { backend = module.backend.security_group_id }
-}
-```
-
-**If CI is to deploy it, add it to `local.github_deploy_modules` in
-`github-oidc.tf` as well.** That list is what the `ecs-deploy` policy is built
-from, so a service missing from it has no `iam:PassRole` on its execution and
-task roles - and the first deploy fails with `AccessDenied` on
-`iam:PassRole` while calling `RegisterTaskDefinition`, which is a confusing
-pair to read: the action named in the error is not the action that was denied.
 
 ### Running the application stack
 

@@ -1,4 +1,4 @@
-# LinkedIn post: ECS service discovery
+# LinkedIn post: ECS service discovery with Service Connect
 
 ---
 
@@ -24,7 +24,7 @@ Hardcoding an IP is not an option. So I built a small ECS lab in Terraform to an
 
 ---
 
-🔗 **Code**: https://github.com/nirgluzman/ecs-lab
+🔗 **Code**: https://github.com/nirgluzman/ecs-service-connect
 
 📖 **AWS docs on Service Connect**: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect.html
 

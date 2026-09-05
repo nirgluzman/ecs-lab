@@ -3,15 +3,17 @@
 # names are supplied by SSM Parameter Store instead.
 #
 # Image names are ECR image URIs: <registry>/<repository>:<tag>. IMAGE_PREFIX
-# defaults to the bare "ecs-lab" namespace for local work; point it at the ECR
-# registry and `docker compose push` uploads all three without re-tagging.
+# defaults to the bare "ecslab" repository prefix for local work; point it at
+# the ECR registry and `docker compose push` uploads all three without
+# re-tagging. That prefix must stay equal to Terraform's name_prefix, which is
+# what ECR repositories are actually named after.
 
-name: ecs-lab   # compose project name; unrelated to the image names below
+name: ecslab   # compose project name; unrelated to the image names below
 
 services:
   mongodb:
     build: ./mongodb
-    image: ${IMAGE_PREFIX:-ecs-lab}/mongodb:${IMAGE_TAG:-dev}
+    image: ${IMAGE_PREFIX:-ecslab}/mongodb:${IMAGE_TAG:-dev}
     restart: unless-stopped
     environment:
       # Consumed by the official entrypoint on first start.
@@ -36,7 +38,7 @@ services:
 
   backend:
     build: ./backend
-    image: ${IMAGE_PREFIX:-ecs-lab}/backend:${IMAGE_TAG:-dev}
+    image: ${IMAGE_PREFIX:-ecslab}/backend:${IMAGE_TAG:-dev}
     restart: unless-stopped
     environment:
       MONGO_HOST: mongodb          # compose DNS name of the service above
@@ -63,7 +65,7 @@ services:
 
   frontend:
     build: ./frontend
-    image: ${IMAGE_PREFIX:-ecs-lab}/frontend:${IMAGE_TAG:-dev}
+    image: ${IMAGE_PREFIX:-ecslab}/frontend:${IMAGE_TAG:-dev}
     restart: unless-stopped
     environment:
       BACKEND_URL: http://backend:8000

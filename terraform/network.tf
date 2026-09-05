@@ -13,9 +13,14 @@ locals {
 
 # VPC resource
 resource "aws_vpc" "this" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_support   = true # enable DNS resolver inside the VPC
-  enable_dns_hostnames = true # enable DNS hostnames for ENIs, required for ECS service discovery
+  cidr_block = var.vpc_cidr
+  # Service Connect resolves aliases in the injected sidecar, not through VPC DNS,
+  # so neither flag is what makes "backend:8000" work. enable_dns_support is what
+  # lets a task resolve ECR, CloudWatch and SSM endpoints at all; hostnames are on
+  # for the ENI records, and would be required if this ever moved to ECS Service
+  # Discovery with a private DNS namespace.
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = { Name = "${var.name_prefix}-vpc" }
 }

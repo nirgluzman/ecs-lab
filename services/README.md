@@ -65,11 +65,13 @@ image URI - `<registry>/<repository>:<tag>`:
 | Part | Local default | On AWS |
 | ---------- | ----------------- | ------------------------------------------ |
 | registry | *(none)* | `<account>.dkr.ecr.<region>.amazonaws.com` |
-| repository | `ecs-lab/backend` | same - one ECR repository per service |
+| repository | `ecslab/backend` | same - one ECR repository per service |
 | tag | `dev` | a git SHA |
 
-ECR repository names may contain `/`, so `ecs-lab/backend` is a legal repository
-name and only the registry prefix changes between local and AWS. Point
+ECR repository names may contain `/`, so `ecslab/backend` is a legal repository
+name and only the registry prefix changes between local and AWS. The `ecslab`
+half is Terraform's `name_prefix`; keep the two equal or the push targets a
+repository that does not exist. Point
 `IMAGE_PREFIX` at the registry and the same build pushes straight up, with no
 `docker tag` step in between:
 
@@ -77,7 +79,7 @@ name and only the registry prefix changes between local and AWS. Point
 aws ecr get-login-password --region <region> \
   | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
 
-export IMAGE_PREFIX=<account>.dkr.ecr.<region>.amazonaws.com/ecs-lab
+export IMAGE_PREFIX=<account>.dkr.ecr.<region>.amazonaws.com/ecslab
 export IMAGE_TAG=$(git rev-parse --short HEAD)
 docker compose build && docker compose push
 ```

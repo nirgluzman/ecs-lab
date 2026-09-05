@@ -149,7 +149,7 @@ variable "app_desired_count" {
 variable "github_repository" {
   description = "repository allowed to assume the CI role, as owner/name"
   type        = string
-  default     = "nirgluzman/ecs-lab"
+  default     = "nirgluzman/ecs-service-connect"
 
   validation {
     condition     = can(regex("^[^/]+/[^/]+$", var.github_repository))

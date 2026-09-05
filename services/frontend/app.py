@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 
 # Service-to-service URL. On compose this is the backend service name; on ECS it
-# becomes a service-discovery name or load balancer DNS.
+# is a Service Connect alias, resolved by the injected sidecar.
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 TIMEOUT = 5  # seconds, per request
 

@@ -24,7 +24,7 @@ frontend/
 
 | Variable      | Default                 | Notes                                    |
 | ------------- | ----------------------- | ---------------------------------------- |
-| `BACKEND_URL` | `http://localhost:8000` | compose sets `http://backend:8000`; on ECS this becomes a service-discovery name or load balancer DNS |
+| `BACKEND_URL` | `http://localhost:8000` | compose sets `http://backend:8000`; on ECS the same name is a Service Connect alias, resolved by the injected sidecar |
 
 ## Run
 
