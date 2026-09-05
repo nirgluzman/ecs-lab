@@ -16,6 +16,14 @@
 *.tfvars
 *.tfvars.json
 
+# --- Python ---
+# uv creates .venv next to each pyproject.toml (see services/*/README.md).
+__pycache__/
+*.py[cod]
+.venv/
+
 # --- Secrets / env ---
 .env
 .env.*
+# ...but the placeholder template is meant to be committed
+!.env.example

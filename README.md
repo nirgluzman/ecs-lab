@@ -4,6 +4,13 @@ A personal sandbox where I experiment with [**Amazon ECS**](https://aws.amazon.c
 
 All infrastructure is provisioned with **Terraform**. Nothing is created by hand in the console, so every experiment is reproducible and disposable.
 
+Two top-level directories:
+
+```
+terraform/   # the AWS infrastructure - VPC, ECS cluster, Fargate services
+services/    # the workload - the containers that run on it
+```
+
 ## Goals
 
 - Build ECS primitives from scratch, one layer at a time, and see how they interact.
@@ -58,11 +65,56 @@ module "backend" {
 }
 ```
 
+## Services
+
+The workload lives in `services/` - three containers wired together by one
+compose file, so the whole stack can be exercised locally before any of it
+reaches ECS.
+
+```
+frontend (Streamlit :8501)  ->  backend (FastAPI :8000)  ->  mongodb (:27017)
+```
+
+```
+services/
+├── docker-compose.yml   # the local stack: build, env, healthchecks, dependencies
+├── .env.example         # credential template - copy to .env
+├── frontend/            # Streamlit UI
+├── backend/             # FastAPI CRUD API over an `items` collection
+└── mongodb/             # mongo:8.0 + init script
+```
+
+Each service is self-contained - its own `Dockerfile`, its own dependencies, its
+own README. Python dependencies are managed with **uv**; both `uv.lock` files are
+committed and the images build with `--locked`, so a build either reproduces the
+exact pinned set or fails.
+
+**Run it locally:**
+
+```bash
+cd services
+cp .env.example .env     # then edit the passwords
+docker compose up --build
+```
+
+Then <http://localhost:8501> for the UI and <http://localhost:8000/docs> for the API.
+
+**Why it is shaped this way:** the stack exists to give the ECS work something
+real to deploy, so every choice mirrors what the task definitions will need.
+Configuration is environment variables only, so the same names come from `.env`
+locally and from **SSM Parameter Store** in AWS, with no code change. The backend
+authenticates as a least-privileged MongoDB user created on first start, never
+root. Both images run as a non-root user. Startup is ordered by health rather
+than luck, and those same health checks become ECS container health checks.
+
+See `services/README.md` for the development loop and per-service detail.
+
 ## Prerequisites
 
 - Terraform
 - AWS CLI v2, with credentials configured (`aws login` or `aws configure`)
-- Docker (for building and pushing images to ECR)
+- Docker with Compose (runs the local stack; builds and pushes images to ECR)
+- [uv](https://docs.astral.sh/uv/) (only to run a Python service outside Docker)
 
 ## Usage
 
@@ -78,10 +130,12 @@ terraform destroy
 ## Conventions
 
 - State is local for now. Move to an S3 backend with native locking (`use_lockfile = true`) before sharing.
-- Secrets never land in the repo: `.env`, `*.tfvars`, `*.tfstate*` and `.claude/settings.local.json` are gitignored.
+- Secrets never land in the repo: `.env`, `*.tfvars`, `*.tfstate*` and `.claude/settings.local.json` are gitignored; `services/.env.example` is the committed template.
 - Shared infrastructure lives in the root; anything instantiated more than once
   becomes a module.
 - One service per `service-*.tf` file, so call sites group together in a listing.
+- One folder per service under `services/`, each owning its Dockerfile,
+  dependencies and README, so a service can be built and deployed on its own.
 
 ## Development Tooling
 
