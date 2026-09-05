@@ -4,13 +4,13 @@ A personal sandbox where I experiment with [**Amazon ECS**](https://aws.amazon.c
 
 All infrastructure is provisioned with **Terraform**. Nothing is created by hand in the console, so every experiment is reproducible and disposable.
 
-Two top-level directories:
+Four top-level directories:
 
 ```
 terraform/   # the AWS infrastructure - VPC, ECS cluster, Fargate services
 services/    # the workload - the containers that run on it
-scripts/     # small operator helpers, e.g. publishing the CI role to GitHub
-.github/     # the workflows that build, push and (next) deploy
+scripts/     # small operator helpers - CI role, service endpoints
+.github/     # the workflows that build, push and deploy
 ```
 
 ## Goals
@@ -27,7 +27,7 @@ A single Terraform root module in `terraform/` - one `init`, one state file, app
 terraform/
 ├── versions.tf          # Terraform and AWS provider version constraints
 ├── providers.tf         # AWS provider: region and default tags
-├── variables.tf         # shared inputs - naming, network, ECR, MongoDB, app services
+├── variables.tf         # shared inputs - naming, network, ECR, MongoDB, app services, CI
 ├── secrets.auto.tfvars.example  # password template - copy to secrets.auto.tfvars
 ├── network.tf           # custom VPC, IGW, one public subnet per AZ, routing
 ├── cluster.tf           # the shared ECS cluster
@@ -46,7 +46,7 @@ terraform/
         ├── variables.tf # the interface - image, port, secrets, discovery, sizing, exposure
         ├── main.tf      # log group, security group, task definition, service, Service Connect
         ├── iam.tf       # per-service execution and task roles
-        └── outputs.tf   # security group ID, role names, log group, task definition ARN
+        └── outputs.tf   # security group ID, service and role ARNs, log group, task definition
 ```
 
 **What it builds:** a VPC with a public subnet in each of two AZs, an ECS cluster,
@@ -215,6 +215,86 @@ ECS that environment comes from the task definition's `secrets` block. Nothing
 is baked in with `--build-arg`, where it would persist in the image's layer
 history for anyone with pull access.
 
+### Deploying
+
+`.github/workflows/deploy.yml` rolls an image that is already in ECR out to the
+services. Manual and separate from the build on purpose: an image that exists
+is not automatically an image that should run.
+
+| Input | Default | |
+| --- | --- | --- |
+| `service` | `all` | deploy one service or the whole stack |
+| `image_tag` | `dev` | the tag to roll out; must already be in ECR |
+| `desired_count` | blank | tasks to run afterwards; blank leaves the count alone |
+
+```bash
+gh workflow run deploy.yml -f image_tag=ac5f183 -f desired_count=1
+```
+
+The mechanics are **describe -> render -> register -> update**. The *running*
+revision is the source of truth, not a file in this repo: it is fetched with
+`describe-task-definition`, only the container's `image` is replaced, and the
+result is registered as a new revision and handed to the service. Everything
+else comes along untouched - roles, sizing, health check, Service Connect, and
+the `secrets` block pointing at SSM. No credential is read or rewritten by the
+deploy; see [Deploys and Terraform drift](#deploys-and-terraform-drift) for why
+none of this shows up in a plan.
+
+`all` deploys **one service at a time, bottom of the stack first** - mongodb,
+backend, frontend - so a cold start comes up in dependency order and
+`fail-fast` means something: if mongodb will not run, the rest are not
+deployed on top of it. Every health check is container-local (`localhost`),
+so parallel deploys would pass too; the ordering buys a coherent stack, not
+passing health checks. The cost is that an `all` run takes the sum of three
+deployments rather than the slowest one.
+
+Two guards worth having:
+
+- **The tag is checked against ECR first.** A missing tag otherwise surfaces
+  minutes later as a failed deployment the circuit breaker rolls back, with the
+  reason buried in the service events.
+- **`wait-for-service-stability`**, so the run reflects the rollout's verdict.
+  Without it the job goes green before the circuit breaker has decided, and a
+  rolled-back deployment reads as a successful one. It is paired with
+  `wait-max-delay-seconds: 15`: left unset, the SDK backs the ECS waiter off
+  exponentially to **ten minutes** between polls, so a service that reached
+  steady state early is noticed minutes later and the job sits there billing
+  the difference.
+
+Expect a service to take a few minutes even so, and the console to look done
+well before the job does. "Task running and healthy" is not "service stable" -
+the old task still has to drain and the deployment has to complete, which took
+3m30s on a one-task service here. With `all` those add up rather than overlap,
+since deployments are serialised.
+
+`desired_count` is how the application services get off zero, since Terraform
+only reads `app_desired_count` when a service is created. Blank parses to `NaN`
+and the action then omits the field entirely, leaving the running count alone.
+
+### Finding a running service
+
+There is no load balancer and no DNS, so a task is reached on the public IP it
+happens to hold - which changes every time it is replaced. Rather than digging
+through the console:
+
+```bash
+./scripts/service-endpoints.sh                 # every service in the cluster
+./scripts/service-endpoints.sh ecslab-frontend # or just these
+```
+
+```
+SERVICE            STATUS    HEALTH     PRIVATE IP       PUBLIC IP        ENDPOINT
+ecslab-mongodb     RUNNING   HEALTHY    10.0.1.125       44.202.245.4     internal
+ecslab-nginx       RUNNING   HEALTHY    10.0.1.40        184.73.145.213   http://184.73.145.213:80
+```
+
+**Every task has a public IP**, internal ones included - there is no NAT
+gateway, so that is how image pulls and log delivery leave. Only the services
+created with `public = true` admit `0.0.0.0/0`, so the script reads each task's
+security group rules rather than assuming, and prints `internal` where the
+address is real but the port will not answer. The port comes from the running
+task definition, not a hardcoded list.
+
 ### Deploys and Terraform drift
 
 A CI deploy registers a new revision of the task definition family and points
@@ -358,19 +438,23 @@ module "worker" {
 
 ### Running the application stack
 
-The three application services default to **`app_desired_count = 0`**: their ECR
-repositories are empty until the build and push step exists, and a service
-pointed at a missing image fails its deployment. So the stack applies cleanly
-today and runs nothing.
+The three application services default to **`app_desired_count = 0`**: a
+service pointed at an image that is not in ECR yet fails its deployment, and on
+a fresh account the repositories are empty until
+[Building and pushing](#building-and-pushing) has run once. So the stack always
+applies cleanly and runs nothing until asked.
 
 That variable is read **only when a service is created**. The module carries
 `ignore_changes = [desired_count]`, because the running count belongs to
 whoever is scaling - a CI deploy, an operator, or an autoscaling policy - and
 without it the next apply would reset the count and silently undo a scale-out.
-So once images are pushed, start the tasks directly rather than through an
-apply:
+So once images are pushed, start the tasks with the deploy workflow's
+`desired_count` input - or directly, but not through an apply:
 
 ```bash
+gh workflow run deploy.yml -f image_tag=dev -f desired_count=1
+
+# or, without deploying anything
 for s in frontend backend mongodb; do
   aws ecs update-service --cluster ecslab-fargate --service "ecslab-$s" --desired-count 1
 done
@@ -379,9 +463,10 @@ done
 `terraform apply -var app_desired_count=1` only takes effect on a service that
 does not exist yet - after a `destroy`, or for one newly added.
 
-`image_tag` (default `dev`) picks the tag, and `app_cpu_architecture` must match
-what the build produced - `docker compose build` on an x86 machine emits x86
-images, and Fargate will not run those on ARM64.
+`image_tag` (default `dev`) picks the tag a newly created service starts with,
+and `app_cpu_architecture` must match what the build produced - the workflow
+builds `linux/amd64`, as does `docker compose build` on an x86 machine, and
+Fargate will not run either on ARM64.
 
 MongoDB runs with **no volume attached**, so its data lives in the task's
 ephemeral storage and disappears when the task is replaced. That is deliberate
