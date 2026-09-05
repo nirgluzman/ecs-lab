@@ -163,6 +163,21 @@ variable "github_default_branch" {
   default     = "main"
 }
 
+# Public identifiers, from `gh api repos/<owner>/<name> --jq '.id, .owner.id'`.
+# They pin the trust policy to this repository as GitHub knows it, not to a
+# name someone else could claim after a rename or a delete.
+variable "github_owner_id" {
+  description = "numeric GitHub ID of the repository owner; null falls back to a name-only match"
+  type        = number
+  default     = 110996563
+}
+
+variable "github_repository_id" {
+  description = "numeric GitHub ID of the repository; null falls back to a name-only match"
+  type        = number
+  default     = 1351712645
+}
+
 variable "github_oidc_subjects" {
   description = "override the trust policy sub patterns entirely, e.g. to allow tags or an environment"
   type        = list(string)

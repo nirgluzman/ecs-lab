@@ -39,9 +39,27 @@ locals {
     one(aws_iam_openid_connect_provider.github[*].arn),
   )
 
+  github_repo_owner = split("/", var.github_repository)[0]
+  github_repo_name  = split("/", var.github_repository)[1]
+
+  # GitHub now issues `sub` with GitHub's own numeric IDs appended to the owner
+  # and the repository - "repo:owner@110996563/repo@1351712645:ref:..." - so a
+  # policy pinning the plain name matches nothing and STS answers "Not
+  # authorized to perform sts:AssumeRoleWithWebIdentity". The IDs are what make
+  # the claim immutable: deleting the repository and recreating it under the
+  # same name produces a different one. `*` when they are not supplied, which
+  # scopes by name alone and gives that property up.
+  github_oidc_repo = (
+    var.github_owner_id != null && var.github_repository_id != null
+    ? "repo:${local.github_repo_owner}@${var.github_owner_id}/${local.github_repo_name}@${var.github_repository_id}"
+    : "repo:${local.github_repo_owner}@*/${local.github_repo_name}@*"
+  )
+
   # `sub` is the claim that says which workflow is calling. Left unconstrained,
-  # any repository on GitHub could assume this role.
+  # any repository on GitHub could assume this role. Both spellings are
+  # allowed: tokens issued before GitHub's ID rollout carry the plain name.
   github_oidc_subjects = length(var.github_oidc_subjects) > 0 ? var.github_oidc_subjects : [
+    "${local.github_oidc_repo}:ref:refs/heads/${var.github_default_branch}",
     "repo:${var.github_repository}:ref:refs/heads/${var.github_default_branch}",
   ]
 }

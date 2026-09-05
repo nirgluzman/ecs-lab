@@ -103,9 +103,33 @@ GitHub could assume the role:
 | Claim | Condition | Value |
 | --- | --- | --- |
 | `aud` | StringEquals | `sts.amazonaws.com` |
+| `sub` | StringLike | `repo:<owner>@<owner_id>/<name>@<repo_id>:ref:refs/heads/<github_default_branch>` |
 | `sub` | StringLike | `repo:<github_repository>:ref:refs/heads/<github_default_branch>` |
 
-Set `github_oidc_subjects` to replace that default entirely - to allow tags
+**Mind the numeric IDs.** GitHub issues `sub` with its own IDs appended to the
+owner and the repository:
+
+```
+repo:nirgluzman@110996563/ecs-lab@1351712645:ref:refs/heads/main
+```
+
+A policy pinning the plain name matches nothing in that format, and STS reports
+every trust-policy miss the same way - `Not authorized to perform
+sts:AssumeRoleWithWebIdentity` - which reads like a missing permission but is
+not one. The role's policies are never consulted; the assume itself is refused.
+CloudTrail is what settles it: the failed `AssumeRoleWithWebIdentity` event
+carries the exact `sub` GitHub sent, under `userIdentity.principalId`.
+
+The IDs come from `github_owner_id` and `github_repository_id`
+(`gh api repos/<owner>/<name> --jq '.id, .owner.id'`), and they are the point of
+the format: deleting the repository and recreating it under the same name
+yields different ones, so a name someone else claims later cannot inherit the
+trust. Setting either to `null` falls back to `repo:<owner>@*/<name>@*`, which
+scopes by name alone and gives that property up. The second row is the
+pre-rollout spelling, kept for tokens issued in the old format - the weaker of
+the two, and safe to drop once nothing sends it.
+
+Set `github_oidc_subjects` to replace both entirely - to allow tags
 (`...:ref:refs/tags/*`) or a deployment environment. The role's inline policy
 grants layer upload and `PutImage` on this project's repositories only, plus
 `ecr:GetAuthorizationToken`, which has no resource to scope to.
