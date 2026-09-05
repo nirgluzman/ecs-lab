@@ -1,0 +1,167 @@
+# Roll an image already in ECR out to the ECS services.
+#
+# Deploying is a separate, manual decision from building: an image that exists
+# is not automatically an image that should run. The pair of them - build-push
+# then deploy - is the whole pipeline.
+#
+# The mechanics are describe -> render -> register -> update: the running task
+# definition is fetched, only its image is replaced, and the new revision is
+# registered and handed to the service. Everything else the definition carries
+# comes along untouched, including the `secrets` block pointing at the SSM
+# parameters, so no credential is ever read or rewritten here.
+name: Deploy to ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: which service to deploy
+        type: choice
+        options: [all, frontend, backend, mongodb]
+        default: all
+      image_tag:
+        description: tag to roll out; must already be in ECR
+        type: string
+        default: dev
+      desired_count:
+        description: "tasks to run after the deploy (blank: leave as is)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  # required: the job asks GitHub for the OIDC token it trades for AWS credentials
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  # terraform's name_prefix - services, families and repositories all use it
+  NAME_PREFIX: ecslab
+  CLUSTER: ecslab-fargate
+
+# Never two deployments of the same service at once: the second would race the
+# first's rollout and the circuit breaker would judge a deployment it did not
+# start.
+concurrency:
+  group: deploy-${{ github.ref }}
+
+jobs:
+  # A choice input cannot express "all", so expand it into the matrix here.
+  # Order matters below, so this list is dependency order, not alphabetical.
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.pick.outputs.services }}
+    steps:
+      - id: pick
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          if [ "$SERVICE" = "all" ]; then
+            echo 'services=["mongodb","backend","frontend"]' >>"$GITHUB_OUTPUT"
+          else
+            echo "services=[\"$SERVICE\"]" >>"$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: select
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One at a time, bottom of the stack first: the backend's health check
+      # talks to mongodb, and the frontend's to the backend, so deploying them
+      # in parallel makes a healthy service look unhealthy. fail-fast stays on
+      # for the same reason - if mongodb will not come up, stop.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        service: ${{ fromJSON(needs.select.outputs.services) }}
+
+    steps:
+      - name: Assume the CI role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          # names the session in CloudTrail, so a deployment is traceable to a run
+          role-session-name: gha-deploy-${{ matrix.service }}-${{ github.run_id }}
+          # the account ID is embedded in every image URI printed below, and
+          # this repository is public
+          mask-aws-account-id: true
+
+      # Only for the registry host it returns - the deploy needs no docker login.
+      # Reading it from here keeps the account ID out of this file.
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve the image
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SERVICE: ${{ matrix.service }}
+          TAG: ${{ inputs.image_tag }}
+        run: |
+          echo "image=$REGISTRY/$NAME_PREFIX/$SERVICE:$TAG" >>"$GITHUB_OUTPUT"
+
+      # A missing tag otherwise surfaces minutes later as a failed deployment
+      # the circuit breaker rolls back, with the reason buried in the events.
+      - name: Verify the tag exists in ECR
+        env:
+          SERVICE: ${{ matrix.service }}
+          TAG: ${{ inputs.image_tag }}
+        run: |
+          if ! aws ecr describe-images \
+              --repository-name "$NAME_PREFIX/$SERVICE" \
+              --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "::error::$NAME_PREFIX/$SERVICE:$TAG is not in ECR - build and push it first"
+            exit 1
+          fi
+
+      # The running revision is the source of truth, not a file in this repo:
+      # it already carries the roles, secrets, sizing and Service Connect
+      # settings terraform registered.
+      - name: Download the running task definition
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$NAME_PREFIX-$SERVICE" \
+            --query taskDefinition >task-definition.json
+
+      - name: Set the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          # the module names the container after the service
+          container-name: ${{ matrix.service }}
+          image: ${{ steps.meta.outputs.image }}
+
+      - name: Register the revision and update the service
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.NAME_PREFIX }}-${{ matrix.service }}
+          cluster: ${{ env.CLUSTER }}
+          # Blank parses to NaN and the action then omits desiredCount entirely,
+          # leaving the running count alone. Terraform ignores this field, so
+          # whatever is set here survives the next apply.
+          desired-count: ${{ inputs.desired_count }}
+          # the deployment circuit breaker rolls a bad image back; without
+          # waiting, the run would go green before that verdict is in
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TD_ARN: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          {
+            echo "### ${{ matrix.service }}"
+            echo ""
+            echo "- image: \`$IMAGE\`"
+            echo "- revision: \`$TD_ARN\`"
+          } >>"$GITHUB_STEP_SUMMARY"
