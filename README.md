@@ -436,6 +436,13 @@ module "worker" {
 }
 ```
 
+**If CI is to deploy it, add it to `local.github_deploy_modules` in
+`github-oidc.tf` as well.** That list is what the `ecs-deploy` policy is built
+from, so a service missing from it has no `iam:PassRole` on its execution and
+task roles - and the first deploy fails with `AccessDenied` on
+`iam:PassRole` while calling `RegisterTaskDefinition`, which is a confusing
+pair to read: the action named in the error is not the action that was denied.
+
 ### Running the application stack
 
 The three application services default to **`app_desired_count = 0`**: a

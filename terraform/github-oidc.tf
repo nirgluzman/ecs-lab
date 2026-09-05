@@ -28,6 +28,10 @@ locals {
   # The services CI is allowed to deploy - the application stack it also builds
   # images for. nginx is deliberately absent: it runs a public upstream image
   # and is not part of the pipeline.
+  #
+  # A new service must be added here before CI can deploy it, or its first
+  # deploy fails with AccessDenied on iam:PassRole while calling
+  # RegisterTaskDefinition.
   github_deploy_modules = {
     frontend = module.frontend
     backend  = module.backend
