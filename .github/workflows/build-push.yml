@@ -75,6 +75,11 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           # names the session in CloudTrail, so a push is traceable to a run
           role-session-name: gha-build-${{ matrix.service }}-${{ github.run_id }}
+          # Off by default. This repository is public, and the account ID is
+          # embedded in every image URI the build logs - not a credential, but
+          # free reconnaissance. Masking here rather than in a later step
+          # covers the ECR login too, which prints the registry it logs into.
+          mask-aws-account-id: true
 
       - name: Log in to ECR
         id: ecr

@@ -200,7 +200,10 @@ Three details that are load-bearing rather than incidental:
   a multi-manifest index whose second entry shows up as an `unknown/unknown`
   platform in the console.
 - **The registry host comes from the login step's `registry` output**, so the
-  account ID is not written into the workflow file.
+  account ID is not written into the workflow file - and
+  `mask-aws-account-id: true` on the credentials step keeps it out of the logs,
+  where it would otherwise appear in every image URI. It renders as
+  `***.dkr.ecr.us-east-1.amazonaws.com/ecslab/backend:<tag>`.
 
 Two tags per build, one immutable and one not. Re-running with the same
 `image_tag` fails on the immutable tag - `dev` moves, the SHA tag does not - so
