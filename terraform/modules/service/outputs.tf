@@ -3,7 +3,7 @@ output "service_name" {
   value       = aws_ecs_service.this.name
 }
 
-# pass this to another service's allowed_security_group_ids to let it connect
+# pass this to another service's allowed_security_groups to let it connect
 output "security_group_id" {
   description = "ID of the task security group"
   value       = aws_security_group.this.id
@@ -23,4 +23,11 @@ output "log_group_name" {
 output "task_role_name" {
   description = "name of the task role, for attaching application permissions"
   value       = aws_iam_role.task.name
+}
+
+# attach parameter- and secret-read policies to this from the root: the
+# execution role, not the task role, fetches a task definition's secrets
+output "execution_role_name" {
+  description = "name of the execution role, for granting access to secrets"
+  value       = aws_iam_role.execution.name
 }

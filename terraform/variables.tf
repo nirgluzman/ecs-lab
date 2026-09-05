@@ -1,3 +1,5 @@
+# --- identity ---------------------------------------------------------------
+
 variable "region" {
   description = "AWS region for all resources"
   type        = string
@@ -9,6 +11,8 @@ variable "name_prefix" {
   type        = string
   default     = "ecslab"
 }
+
+# --- networking -------------------------------------------------------------
 
 variable "vpc_cidr" {
   description = "CIDR block for the VPC"
@@ -32,4 +36,106 @@ variable "az_count" {
     condition     = var.az_count >= 1 && var.az_count <= 3
     error_message = "az_count must be between 1 and 3"
   }
+}
+
+# --- ECR --------------------------------------------------------------------
+
+variable "ecr_repositories" {
+  description = "one repository per service directory under services/"
+  type        = list(string)
+  default     = ["frontend", "backend", "mongodb"]
+}
+
+variable "ecr_mutable_tag_filters" {
+  description = "wildcard tag patterns exempt from immutability, for tags the local loop overwrites"
+  type        = list(string)
+  default     = ["dev*", "latest"]
+
+  # AWS caps the exclusion list at 5 filters per repository
+  validation {
+    condition     = length(var.ecr_mutable_tag_filters) <= 5
+    error_message = "at most 5 exclusion filters per repository"
+  }
+}
+
+variable "ecr_image_retention_count" {
+  description = "number of tagged images to keep per repository"
+  type        = number
+  default     = 10
+}
+
+variable "ecr_untagged_retention_days" {
+  description = "days an untagged image survives before the lifecycle policy expires it"
+  type        = number
+  default     = 1
+}
+
+# --- MongoDB, stored in SSM Parameter Store ---------------------------------
+
+variable "mongo_db" {
+  description = "application database name"
+  type        = string
+  default     = "appdb"
+}
+
+variable "mongo_root_username" {
+  description = "database superuser, created on first start; administration only"
+  type        = string
+  default     = "root"
+}
+
+variable "mongo_app_username" {
+  description = "least-privileged user the backend connects with"
+  type        = string
+  default     = "app"
+}
+
+# Ephemeral: never written to state or to a plan file, and so never defaulted
+# to a placeholder either - a missing password should fail, not ship.
+variable "mongo_root_password" {
+  description = "password for mongo_root_username; set in secrets.auto.tfvars or TF_VAR_mongo_root_password"
+  type        = string
+  ephemeral   = true
+  sensitive   = true
+}
+
+variable "mongo_app_password" {
+  description = "password for mongo_app_username; set in secrets.auto.tfvars or TF_VAR_mongo_app_password"
+  type        = string
+  ephemeral   = true
+  sensitive   = true
+}
+
+variable "mongo_secret_version" {
+  description = "bump to push new password values; write-only values are invisible to the plan, so nothing else triggers a write"
+  type        = number
+  default     = 1
+}
+
+# --- application services ---------------------------------------------------
+
+variable "image_tag" {
+  description = "tag the three application services run; must exist in ECR before they can start"
+  type        = string
+  default     = "dev"
+}
+
+variable "app_cpu_architecture" {
+  description = "must match what the build produces - docker compose on an x86 machine emits X86_64 images, and Fargate will not run them on ARM64"
+  type        = string
+  default     = "X86_64"
+
+  validation {
+    condition     = contains(["ARM64", "X86_64"], var.app_cpu_architecture)
+    error_message = "app_cpu_architecture must be ARM64 or X86_64"
+  }
+}
+
+# The ECR repositories are empty until the build and push step exists, and a
+# service pointed at a missing image fails its deployment. Zero lets the whole
+# stack apply cleanly now; raise it once the images are pushed.
+variable "app_desired_count" {
+  description = "tasks to run for frontend, backend and mongodb"
+  type        = number
+  default     = 0
 }

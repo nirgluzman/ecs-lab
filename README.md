@@ -25,45 +25,187 @@ A single Terraform root module in `terraform/` - one `init`, one state file, app
 terraform/
 ├── versions.tf          # Terraform and AWS provider version constraints
 ├── providers.tf         # AWS provider: region and default tags
-├── variables.tf         # shared inputs - region, name prefix, VPC CIDR, AZ count
+├── variables.tf         # shared inputs - naming, network, ECR, MongoDB, app services
+├── secrets.auto.tfvars.example  # password template - copy to secrets.auto.tfvars
 ├── network.tf           # custom VPC, IGW, one public subnet per AZ, routing
 ├── cluster.tf           # the shared ECS cluster
-├── service-proxy.tf     # nginx at the edge - a module "service" call
-├── outputs.tf           # VPC and subnet IDs, cluster and service names
+├── ecr.tf               # one private image repository per service
+├── ssm.tf               # service configuration and credentials in Parameter Store
+├── namespaces.tf        # two Cloud Map namespaces for Service Connect
+├── service-nginx.tf     # nginx at the edge - a standalone experiment
+├── service-frontend.tf  # Streamlit, internet-facing
+├── service-backend.tf   # FastAPI, internal
+├── service-mongodb.tf   # MongoDB, internal
+├── outputs.tf           # VPC and subnet IDs, service names, registry and parameter ARNs
 └── modules/
     └── service/         # one Fargate service, instantiated once per microservice
         ├── versions.tf
-        ├── variables.tf # the interface - image, port, sizing, exposure
-        ├── main.tf      # log group, security group, task definition, service
+        ├── variables.tf # the interface - image, port, secrets, discovery, sizing, exposure
+        ├── main.tf      # log group, security group, task definition, service, Service Connect
         ├── iam.tf       # per-service execution and task roles
-        └── outputs.tf   # security group ID, task role name, log group
+        └── outputs.tf   # security group ID, role names, log group, task definition ARN
 ```
 
 **What it builds:** a VPC with a public subnet in each of two AZs, an ECS cluster,
-and one Fargate service running nginx at the edge. No NAT gateway and no load
-balancer - tasks reach the internet through the IGW and are reached directly on
-their own public IP.
+one private ECR repository per service, the service configuration in Parameter
+Store, two Cloud Map namespaces, and four Fargate services - nginx on its own,
+plus the frontend, backend and mongodb of the application stack. No NAT gateway
+and no load balancer - tasks reach the internet through the IGW and are reached
+directly on their own public IP.
 
 **Why a `service` module:** the goal is several microservices sharing one VPC and
 one cluster. Each has the same shape - task definition, log group, security group,
-its own IAM roles - and differs only in image, port, sizing and exposure. The VPC
-and the cluster stay in the root because each exists exactly once.
+its own IAM roles - and differs only in image, port, sizing, exposure, secrets,
+health check and discovery. The VPC, the cluster and the namespaces stay in the root because
+each exists exactly once.
 
-**Adding a service:** copy `service-proxy.tf` to `service-<name>.tf`. Internal
+### Image registry
+
+`ecr.tf` creates one private repository per entry in `ecr_repositories`, named
+`<name_prefix>/<service>`. The resulting image URI - `<account>.dkr.ecr.<region>.amazonaws.com/ecslab/backend:<tag>` -
+is exactly the `<IMAGE_PREFIX>/<service>:<IMAGE_TAG>` shape Compose already
+builds, so the same build pushes to ECR with no re-tagging:
+
+```bash
+export IMAGE_PREFIX=$(terraform -chdir=terraform output -raw ecr_registry)
+```
+
+Tags are immutable, because a moved tag is a rollback that silently does
+nothing - ECS resolves a task definition to a digest. The tags the local loop
+overwrites (`dev*`, `latest`) are excluded via `ecr_mutable_tag_filters`.
+A lifecycle policy expires untagged images after a day and keeps the newest ten
+tagged ones, so rebuilds do not accumulate billable layers. Repositories are
+`force_delete = true` so `terraform destroy` still leaves nothing behind.
+
+Pulls need no repository policy: the per-service execution role already carries
+`AmazonECSTaskExecutionRolePolicy`, and in-account access is settled by that
+identity policy alone.
+
+**Building and pushing is not wired up yet** - the repositories exist, the
+pipeline that fills them comes later.
+
+### Configuration and secrets
+
+`ssm.tf` holds the credentials half of `services/.env.example` in SSM Parameter
+Store, under `/ecslab/mongodb/`. `IMAGE_PREFIX` and `IMAGE_TAG` are deliberately
+absent - they select which image runs, which is the task definition's job.
+
+One parameter per fact, not per environment variable. The same password is read
+by mongodb as `MONGO_INITDB_ROOT_PASSWORD` and by the backend as
+`MONGO_PASSWORD`, so a task definition's `secrets` block maps each parameter to
+whatever name the container expects:
+
+| Parameter | Type | From `.env` |
+| --- | --- | --- |
+| `/ecslab/mongodb/root-username` | String | `MONGO_ROOT_USERNAME` |
+| `/ecslab/mongodb/root-password` | SecureString | `MONGO_ROOT_PASSWORD` |
+| `/ecslab/mongodb/app-username` | String | `MONGO_APP_USERNAME` |
+| `/ecslab/mongodb/app-password` | SecureString | `MONGO_APP_PASSWORD` |
+| `/ecslab/mongodb/database` | String | `MONGO_DB` |
+
+Usernames stay `String` - knowing the app user is called `app` is not a way in,
+and plain parameters are readable without a decrypt call. Passwords are
+`SecureString` under the AWS managed key `alias/aws/ssm`, which is why the
+execution role needs no `kms:Decrypt`; a customer-managed key would require it.
+
+**Passwords never enter the state file.** They are set through Terraform 1.11's
+write-only `value_wo` argument from `ephemeral` variables, so the plaintext goes
+to AWS and nowhere else - not `terraform.tfstate`, not a saved plan:
+
+```bash
+cd terraform
+cp secrets.auto.tfvars.example secrets.auto.tfvars   # gitignored; then edit
+terraform apply
+```
+
+The cost of that is no drift detection: Terraform cannot compare a value it does
+not keep. Bump `mongo_secret_version` to push a changed password.
+
+Fetching these is the **execution role's** job, not the task role's - it reads
+them before the container starts. `ssm.tf` creates the read policy for that;
+attach it to a service with the module's `execution_role_name` output.
+
+### Namespaces
+
+`namespaces.tf` creates two Cloud Map HTTP namespaces, and `cluster.tf` still
+creates exactly one cluster. **A namespace is a discovery boundary, not a
+placement boundary** - all four services run in the same cluster, on the same
+subnets, but a service can only resolve names inside its own namespace:
+
+```
+ecslab-fargate  (one cluster)
+├── ecslab-nginx namespace   nginx
+└── ecslab-app   namespace   frontend -> backend -> mongodb
+```
+
+nginx is the standalone edge experiment and sits alone in `ecslab-nginx`, so it
+cannot see the application stack even though it shares every piece of
+infrastructure with it.
+
+Inside `ecslab-app`, discovery is **Service Connect**: ECS injects an Envoy
+sidecar, and a client connects to `backend:8000` or `mongodb:27017` rather than
+to a task IP that changes on every deployment. HTTP namespaces, not private DNS
+ones - the names are resolved by the sidecar, so there is no hosted zone to pay
+for or clean up. Two knobs on the module control it:
+
+- `namespace_arn` - which namespace to join, `null` to opt out entirely.
+- `discoverable` - register a name others can call. The frontend is `false`: it
+  joins as a *client*, which is what lets it resolve `backend`, but nothing
+  calls it by name.
+
+Security groups are unchanged by any of this. The sidecar still connects to the
+target ENI on the container port, so mongodb admits the backend's security
+group and the backend admits the frontend's - identity, not IP addresses. Those
+are passed as a **map** keyed by a caller-chosen label, not a list: `for_each`
+keys must be known at plan time and a security group ID is not.
+MongoDB stays on plain TCP; the backend declares `app_protocol = "http"`.
+
+The proxy is not free. It is a second container drawing on the same task-level
+`cpu` and `memory`, and AWS asks for 256 extra CPU units and at least 64 MiB to
+cover it - so every service in a namespace is sized 512/1024 rather than
+the module's 256/512 default.
+
+**Adding a service:** copy `service-nginx.tf` to `service-<name>.tf`. Internal
 services stay off the internet and name who may reach them:
 
 ```hcl
-module "backend" {
+module "worker" {
   source = "./modules/service"
 
-  name   = "backend"
+  name   = "worker"
   image  = "..."
   public = false
 
-  # tracks the proxy's tasks as their IPs churn
-  allowed_security_group_ids = [module.proxy.security_group_id]
+  # join the namespace and register "worker" for others to call
+  namespace_arn = aws_service_discovery_http_namespace.app.arn
+  discoverable  = true
+
+  # tracks the backend's tasks as their IPs churn. A map, not a list: for_each
+  # keys must be known at plan time, and a security group ID is not.
+  allowed_security_groups = { backend = module.backend.security_group_id }
 }
 ```
+
+### Running the application stack
+
+The three application services default to **`app_desired_count = 0`**: their ECR
+repositories are empty until the build and push step exists, and a service
+pointed at a missing image fails its deployment. So the stack applies cleanly
+today and runs nothing. Once images are pushed:
+
+```bash
+terraform apply -var app_desired_count=1
+```
+
+`image_tag` (default `dev`) picks the tag, and `app_cpu_architecture` must match
+what the build produced - `docker compose build` on an x86 machine emits x86
+images, and Fargate will not run those on ARM64.
+
+MongoDB runs with **no volume attached**, so its data lives in the task's
+ephemeral storage and disappears when the task is replaced. That is deliberate
+for a lab - it also means `/docker-entrypoint-initdb.d` re-runs on every fresh
+task, so the application user is always re-created - but an EFS volume is the
+prerequisite for keeping anything.
 
 ## Services
 
@@ -122,6 +264,7 @@ See `services/README.md` for the development loop and per-service detail.
 
 ```bash
 cd terraform
+cp secrets.auto.tfvars.example secrets.auto.tfvars   # then edit; apply prompts without it
 terraform init
 terraform plan
 terraform apply
@@ -129,10 +272,15 @@ terraform apply
 terraform destroy
 ```
 
+The first apply brings up nginx only. The application services are created with
+`app_desired_count = 0`, so nothing tries to pull from the still-empty ECR
+repositories - see [Running the application stack](#running-the-application-stack).
+
 ## Conventions
 
 - State is local for now. Move to an S3 backend with native locking (`use_lockfile = true`) before sharing.
-- Secrets never land in the repo: `.env`, `*.tfvars`, `*.tfstate*` and `.claude/settings.local.json` are gitignored; `services/.env.example` is the committed template.
+- Secrets never land in the repo: `.env`, `*.tfvars`, `*.tfstate*` and `.claude/settings.local.json` are gitignored; `services/.env.example` and
+  `terraform/secrets.auto.tfvars.example` are the committed templates.
 - Shared infrastructure lives in the root; anything instantiated more than once
   becomes a module.
 - One service per `service-*.tf` file, so call sites group together in a listing.

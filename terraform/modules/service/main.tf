@@ -4,6 +4,10 @@
 
 locals {
   full_name = "${var.name_prefix}-${var.name}"
+
+  # Service Connect matches a service to a container port by this name, so the
+  # portMappings entry and the service block below must agree on it.
+  port_name = "${var.name}-${var.container_port}"
 }
 
 # --- logging ----------------------------------------------------------------
@@ -41,10 +45,10 @@ resource "aws_vpc_security_group_ingress_rule" "public" {
 
 # service-to-service: reference the caller's SG, not its IPs, which churn
 resource "aws_vpc_security_group_ingress_rule" "from_service" {
-  for_each = toset(var.allowed_security_group_ids)
+  for_each = var.allowed_security_groups
 
   security_group_id            = aws_security_group.this.id
-  description                  = "from ${each.value}"
+  description                  = "from ${each.key}"
   referenced_security_group_id = each.value
   from_port                    = var.container_port
   to_port                      = var.container_port
@@ -92,13 +96,30 @@ resource "aws_ecs_task_definition" "this" {
       # port mapping requires only the container port in awsvpc mode
       portMappings = [
         {
-          name          = "${var.name}-${var.container_port}"
+          name          = local.port_name
           containerPort = var.container_port
           protocol      = "tcp"
+          # null leaves the Service Connect proxy on plain TCP; "http" buys
+          # per-request metrics but assumes the traffic really is HTTP
+          appProtocol = var.app_protocol
         }
       ]
 
       environment = [for k, v in var.environment : { name = k, value = v }]
+
+      # Fetched by the execution role at start-up, so the value never appears
+      # in the task definition, the console, or `describe-tasks` output.
+      secrets = [for k, v in var.secrets : { name = k, valueFrom = v }]
+
+      # The container reports its own readiness; ECS replaces it when it stops
+      # passing. Without one, "running" only means the process has not exited.
+      healthCheck = var.health_check == null ? null : {
+        command     = var.health_check.command
+        interval    = var.health_check.interval
+        timeout     = var.health_check.timeout
+        retries     = var.health_check.retries
+        startPeriod = var.health_check.start_period
+      }
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -133,6 +154,46 @@ resource "aws_ecs_service" "this" {
     subnets          = var.subnet_ids
     security_groups  = [aws_security_group.this.id]
     assign_public_ip = var.assign_public_ip
+  }
+
+  # Service Connect: ECS injects an Envoy sidecar that resolves the namespace's
+  # client aliases, so a client reaches "backend:8000" instead of a task IP that
+  # changes on every deployment. Security groups still apply - the sidecar
+  # connects to the target ENI on container_port like anything else.
+  dynamic "service_connect_configuration" {
+    for_each = var.namespace_arn == null ? [] : [1]
+
+    content {
+      enabled   = true
+      namespace = var.namespace_arn
+
+      # the sidecar is a separate container, so it needs its own stream prefix
+      log_configuration {
+        log_driver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.this.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "service-connect"
+        }
+      }
+
+      # Present only for services others call. A client-only service still
+      # joins the namespace - that is what lets it resolve the aliases - but
+      # registers no name of its own.
+      dynamic "service" {
+        for_each = var.discoverable ? [1] : []
+
+        content {
+          port_name      = local.port_name
+          discovery_name = var.name
+
+          client_alias {
+            dns_name = var.name
+            port     = var.container_port
+          }
+        }
+      }
+    }
   }
 
   # Terraform sees no reference to this, but the first image pull needs it
