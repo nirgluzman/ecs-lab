@@ -68,10 +68,11 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
-      # One at a time, bottom of the stack first: the backend's health check
-      # talks to mongodb, and the frontend's to the backend, so deploying them
-      # in parallel makes a healthy service look unhealthy. fail-fast stays on
-      # for the same reason - if mongodb will not come up, stop.
+      # One at a time, bottom of the stack first, so a cold start comes up in
+      # dependency order and fail-fast means something: if mongodb will not
+      # run, do not deploy the rest on top of it. Every health check is
+      # container-local, so parallel would pass too - this buys a coherent
+      # stack, at the cost of an "all" run taking the sum of three deployments.
       max-parallel: 1
       fail-fast: true
       matrix:
@@ -153,6 +154,11 @@ jobs:
           # waiting, the run would go green before that verdict is in
           wait-for-service-stability: true
           wait-for-minutes: 10
+          # Poll every 15s. Left unset, the SDK backs the ECS waiter off
+          # exponentially to ten minutes between attempts, so a service that
+          # went stable early is noticed minutes later and the job bills the
+          # difference - the wait becomes longer than the deployment.
+          wait-max-delay-seconds: 15
 
       - name: Summary
         env:
