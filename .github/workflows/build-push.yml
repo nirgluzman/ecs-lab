@@ -1,0 +1,135 @@
+# Build the three application images and push them to ECR.
+#
+# Manual only, deliberately: a commit on main is not a release here, and the
+# task definitions select an image by tag, not by whatever main last contained.
+# Credentials come from the OIDC role in terraform/github-oidc.tf - the only
+# thing this repository stores is that role's ARN, as AWS_OIDC_ROLE.
+name: Build and push images
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: which image to build
+        type: choice
+        options: [all, frontend, backend, mongodb]
+        default: all
+      image_tag:
+        description: "tag to push (default: the short commit SHA)"
+        type: string
+        default: ""
+      push_dev_tag:
+        description: also move the mutable dev tag to this build
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  # required: the job asks GitHub for the OIDC token it trades for AWS credentials
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  # terraform's name_prefix - repositories are named <prefix>/<service>
+  NAME_PREFIX: ecslab
+
+# One push at a time per ref. Not cancel-in-progress: a half-pushed image is a
+# worse outcome than a queued run.
+concurrency:
+  group: build-push-${{ github.ref }}
+
+jobs:
+  # A choice input cannot express "all", so expand it into the matrix here.
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.pick.outputs.services }}
+    steps:
+      - id: pick
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          if [ "$SERVICE" = "all" ]; then
+            echo 'services=["frontend","backend","mongodb"]' >>"$GITHUB_OUTPUT"
+          else
+            echo "services=[\"$SERVICE\"]" >>"$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: select
+    runs-on: ubuntu-latest
+
+    strategy:
+      # one bad Dockerfile should not cancel the images that do build
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.select.outputs.services) }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assume the CI role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          # names the session in CloudTrail, so a push is traceable to a run
+          role-session-name: gha-build-${{ matrix.service }}-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The registry host is an output of the login step, so the account ID
+      # never appears in this file.
+      - name: Resolve image tags
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SERVICE: ${{ matrix.service }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+          PUSH_DEV: ${{ inputs.push_dev_tag }}
+        run: |
+          tag="${INPUT_TAG:-${GITHUB_SHA::7}}"
+          repo="$REGISTRY/$NAME_PREFIX/$SERVICE"
+          {
+            echo "tags<<TAGS"
+            echo "$repo:$tag"
+            # "dev" is one of the mutable tags ecr.tf exempts from immutability,
+            # and the tag terraform's image_tag defaults to
+            if [ "$PUSH_DEV" = "true" ]; then echo "$repo:dev"; fi
+            echo "TAGS"
+            echo "image=$repo:$tag"
+          } >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          # each service owns its Dockerfile and builds from its own directory
+          context: services/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # must match terraform's app_cpu_architecture (X86_64), or Fargate
+          # refuses to place the task
+          platforms: linux/amd64
+          # a provenance attestation turns the push into a multi-manifest index
+          # whose extra entry shows up as an unknown/unknown platform
+          provenance: false
+          # layer cache shared between runs, kept separate per service
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### ${{ matrix.service }}"
+            echo ""
+            echo "- image: \`$IMAGE\`"
+            echo "- digest: \`$DIGEST\`"
+          } >>"$GITHUB_STEP_SUMMARY"

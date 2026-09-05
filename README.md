@@ -10,6 +10,7 @@ Two top-level directories:
 terraform/   # the AWS infrastructure - VPC, ECS cluster, Fargate services
 services/    # the workload - the containers that run on it
 scripts/     # small operator helpers, e.g. publishing the CI role to GitHub
+.github/     # the workflows that build, push and (next) deploy
 ```
 
 ## Goals
@@ -84,8 +85,9 @@ Pulls need no repository policy: the per-service execution role already carries
 identity policy alone.
 
 Pushes from CI authenticate through the role in
-[CI credentials](#ci-credentials-github-actions-oidc); the workflow that
-builds and pushes comes next.
+[CI credentials](#ci-credentials-github-actions-oidc), and
+[Building and pushing](#building-and-pushing) is the workflow that fills the
+repositories.
 
 ### CI credentials (GitHub Actions OIDC)
 
@@ -141,6 +143,50 @@ That reads the `github_actions_role_arn` output, sets it as the
 `terraform/outputs.json` - the registry host, cluster and service names the
 deploy workflow needs, in one place. That dump is gitignored: it is a
 rebuildable artifact of an apply, and outputs can carry sensitive values.
+
+### Building and pushing
+
+`.github/workflows/build-push.yml` builds the three application images and
+pushes them to ECR. **Manual only** (`workflow_dispatch`): a commit on main is
+not a release here, and a task definition selects an image by tag, not by
+whatever main last contained.
+
+| Input | Default | |
+| --- | --- | --- |
+| `service` | `all` | build one image or all three |
+| `image_tag` | short commit SHA | the immutable tag this build gets |
+| `push_dev_tag` | `true` | also move `dev`, the tag `image_tag` defaults to |
+
+Run it from the Actions tab, or:
+
+```bash
+gh workflow run build-push.yml -f service=all
+```
+
+Each service builds in a matrix job, from its own directory as the build
+context, and `fail-fast` is off so one broken Dockerfile does not cancel the
+others. Layers are cached per service in the GitHub Actions cache.
+
+Three details that are load-bearing rather than incidental:
+
+- **`platforms: linux/amd64`** must agree with `app_cpu_architecture`
+  (`X86_64`). Fargate refuses to place a task whose image is built for the
+  other architecture.
+- **`provenance: false`**, because a provenance attestation turns the push into
+  a multi-manifest index whose second entry shows up as an `unknown/unknown`
+  platform in the console.
+- **The registry host comes from the login step's `registry` output**, so the
+  account ID is not written into the workflow file.
+
+Two tags per build, one immutable and one not. Re-running with the same
+`image_tag` fails on the immutable tag - `dev` moves, the SHA tag does not - so
+re-run against a tag that has not been pushed, or rely on `dev`.
+
+No credentials reach the build. The images are configuration-free: the MongoDB
+root and application users are read from the environment at first start, and on
+ECS that environment comes from the task definition's `secrets` block. Nothing
+is baked in with `--build-arg`, where it would persist in the image's layer
+history for anyone with pull access.
 
 ### Deploys and Terraform drift
 
