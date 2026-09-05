@@ -78,7 +78,7 @@ frontend (Streamlit :8501)  ->  backend (FastAPI :8000)  ->  mongodb (:27017)
 ```
 services/
 ├── docker-compose.yml   # the local stack: build, env, healthchecks, dependencies
-├── .env.example         # credential template - copy to .env
+├── .env.example         # image + credential template - copy to .env
 ├── frontend/            # Streamlit UI
 ├── backend/             # FastAPI CRUD API over an `items` collection
 └── mongodb/             # mongo:8.0 + init script
@@ -102,7 +102,9 @@ Then <http://localhost:8501> for the UI and <http://localhost:8000/docs> for the
 **Why it is shaped this way:** the stack exists to give the ECS work something
 real to deploy, so every choice mirrors what the task definitions will need.
 Configuration is environment variables only, so the same names come from `.env`
-locally and from **SSM Parameter Store** in AWS, with no code change. The backend
+locally and from **SSM Parameter Store** in AWS, with no code change. Compose
+builds `<IMAGE_PREFIX>/<service>:<IMAGE_TAG>`, an ECR image URI, so pointing
+`IMAGE_PREFIX` at the registry pushes the same build to ECR untouched. The backend
 authenticates as a least-privileged MongoDB user created on first start, never
 root. Both images run as a non-root user. Startup is ordered by health rather
 than luck, and those same health checks become ECS container health checks.

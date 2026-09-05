@@ -14,7 +14,7 @@ reproduces the exact pinned set or fails.
 ```
 services/
 ├── docker-compose.yml   # the local stack: build, env, healthchecks, dependencies
-├── .env.example         # credential template - copy to .env
+├── .env.example         # image + credential template - copy to .env
 ├── frontend/            # Streamlit UI
 ├── backend/             # FastAPI CRUD API
 └── mongodb/             # mongo:8.0 + init script
@@ -56,6 +56,37 @@ docker compose ps                  # health status of each service
 docker compose down                # stop, keep the database volume
 docker compose down -v             # stop and wipe the data (re-runs the DB init script)
 ```
+
+## Images
+
+Compose builds `<IMAGE_PREFIX>/<service>:<IMAGE_TAG>`, which is exactly an ECR
+image URI - `<registry>/<repository>:<tag>`:
+
+| Part | Local default | On AWS |
+| ---------- | ----------------- | ------------------------------------------ |
+| registry | *(none)* | `<account>.dkr.ecr.<region>.amazonaws.com` |
+| repository | `ecs-lab/backend` | same - one ECR repository per service |
+| tag | `dev` | a git SHA |
+
+ECR repository names may contain `/`, so `ecs-lab/backend` is a legal repository
+name and only the registry prefix changes between local and AWS. Point
+`IMAGE_PREFIX` at the registry and the same build pushes straight up, with no
+`docker tag` step in between:
+
+```bash
+aws ecr get-login-password --region <region> \
+  | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+
+export IMAGE_PREFIX=<account>.dkr.ecr.<region>.amazonaws.com/ecs-lab
+export IMAGE_TAG=$(git rev-parse --short HEAD)
+docker compose build && docker compose push
+```
+
+Each repository has to exist in ECR first - `docker push` does not create one.
+
+Use an immutable tag for anything ECS pulls. A task definition pinned to a
+mutable tag like `dev` will not reliably pick up a new push: ECS re-pulls when
+the task definition changes, so the image URI itself has to change.
 
 ## Credentials
 

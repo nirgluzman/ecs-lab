@@ -1,13 +1,17 @@
 # Local-only stack: Streamlit -> FastAPI -> MongoDB.
 # Values come from services/.env (copy .env.example). In AWS these same variable
 # names are supplied by SSM Parameter Store instead.
+#
+# Image names are ECR image URIs: <registry>/<repository>:<tag>. IMAGE_PREFIX
+# defaults to the bare "ecs-lab" namespace for local work; point it at the ECR
+# registry and `docker compose push` uploads all three without re-tagging.
 
-name: ecs-lab
+name: ecs-lab   # compose project name; unrelated to the image names below
 
 services:
   mongodb:
     build: ./mongodb
-    image: ecs-lab/mongodb:dev
+    image: ${IMAGE_PREFIX:-ecs-lab}/mongodb:${IMAGE_TAG:-dev}
     restart: unless-stopped
     environment:
       # Consumed by the official entrypoint on first start.
@@ -32,7 +36,7 @@ services:
 
   backend:
     build: ./backend
-    image: ecs-lab/backend:dev
+    image: ${IMAGE_PREFIX:-ecs-lab}/backend:${IMAGE_TAG:-dev}
     restart: unless-stopped
     environment:
       MONGO_HOST: mongodb          # compose DNS name of the service above
@@ -59,7 +63,7 @@ services:
 
   frontend:
     build: ./frontend
-    image: ecs-lab/frontend:dev
+    image: ${IMAGE_PREFIX:-ecs-lab}/frontend:${IMAGE_TAG:-dev}
     restart: unless-stopped
     environment:
       BACKEND_URL: http://backend:8000
