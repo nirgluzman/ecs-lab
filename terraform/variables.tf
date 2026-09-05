@@ -133,9 +133,13 @@ variable "app_cpu_architecture" {
 
 # The ECR repositories are empty until the build and push step exists, and a
 # service pointed at a missing image fails its deployment. Zero lets the whole
-# stack apply cleanly now; raise it once the images are pushed.
+# stack apply cleanly now.
+#
+# Read only when a service is created: the module ignores later changes to
+# desired_count so a deploy or an operator can scale without an apply undoing
+# it. Scale an existing service with `aws ecs update-service --desired-count`.
 variable "app_desired_count" {
-  description = "tasks to run for frontend, backend and mongodb"
+  description = "tasks the application services start with; ignored once they exist"
   type        = number
   default     = 0
 }

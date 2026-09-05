@@ -198,4 +198,23 @@ resource "aws_ecs_service" "this" {
 
   # Terraform sees no reference to this, but the first image pull needs it
   depends_on = [aws_iam_role_policy_attachment.execution]
+
+  lifecycle {
+    # Both of these are set at creation and then owned by whoever deploys.
+    #
+    # desired_count: the running count belongs to a CI deploy, an operator with
+    # `aws ecs update-service --desired-count`, or later an autoscaling target.
+    #
+    # task_definition: a CI deploy registers its own revision of this family -
+    # same definition, new image tag - and points the service at it. Terraform
+    # still holds the revision *it* registered, so without this every apply
+    # after a deploy would roll the service back to the last image Terraform
+    # knew about.
+    #
+    # The cost is that a Terraform change to the task definition (cpu, memory,
+    # a new secret) registers a revision the service does not pick up. Deploy
+    # afterwards - CI reads the family's newest revision - or move the service
+    # forward once by hand.
+    ignore_changes = [desired_count, task_definition]
+  }
 }

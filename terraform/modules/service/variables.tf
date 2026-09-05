@@ -104,8 +104,11 @@ variable "memory" {
   default     = 512
 }
 
+# Create-time only: the service ignores later changes to desired_count, so
+# scaling an existing service is `aws ecs update-service --desired-count N`
+# (or a deploy, or an autoscaling policy), not an apply.
 variable "desired_count" {
-  description = "number of tasks to keep running"
+  description = "tasks to run when the service is first created; ignored on later applies"
   type        = number
   default     = 1
 }

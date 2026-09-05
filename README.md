@@ -142,6 +142,45 @@ That reads the `github_actions_role_arn` output, sets it as the
 deploy workflow needs, in one place. That dump is gitignored: it is a
 rebuildable artifact of an apply, and outputs can carry sensitive values.
 
+### Deploys and Terraform drift
+
+A CI deploy registers a new revision of the task definition family and points
+the service at it. Terraform still holds the revision *it* registered, so
+`aws_ecs_service` ignores the two attributes a deploy moves:
+
+```hcl
+lifecycle {
+  ignore_changes = [desired_count, task_definition]
+}
+```
+
+Without them the next `terraform apply` after a deploy rolls the service back
+to the last image Terraform knew about, and resets the running count. Nothing
+else a deploy touches is Terraform-managed:
+
+| What CI does | Terraform's view |
+| --- | --- |
+| pushes an image to ECR | repository config is unchanged; images are not state |
+| registers a task definition revision | a new revision of the same family; Terraform's own revision stays `ACTIVE`, so refresh sees no change |
+| `UpdateService` to that revision | ignored, as above |
+| scales the service | ignored, as above |
+
+The CI role has no `ecs:DeregisterTaskDefinition`, deliberately: deregistering
+the revision Terraform holds would flip it to `INACTIVE` and make every plan
+want to recreate it.
+
+Two things the deploy workflow must not do, because Terraform sets neither and
+would plan them back on the next apply: pass `enable-ecs-managed-tags` or
+`propagate-tags` to the deploy action. Set them here first if they are wanted.
+
+The cost of ignoring `task_definition` is that a Terraform change to the task
+definition - cpu, memory, a new secret - registers a revision the service does
+not pick up. Deploy afterwards, since CI reads the family's newest revision.
+
+Watch the ECR lifecycle policy too: it keeps the newest ten tagged images per
+repository, so a busy pipeline can expire the image an older revision points
+at. That is not drift, but it is a rollback that will not pull.
+
 ### Configuration and secrets
 
 `ssm.tf` holds the credentials half of `services/.env.example` in SSM Parameter
@@ -249,11 +288,23 @@ module "worker" {
 The three application services default to **`app_desired_count = 0`**: their ECR
 repositories are empty until the build and push step exists, and a service
 pointed at a missing image fails its deployment. So the stack applies cleanly
-today and runs nothing. Once images are pushed:
+today and runs nothing.
+
+That variable is read **only when a service is created**. The module carries
+`ignore_changes = [desired_count]`, because the running count belongs to
+whoever is scaling - a CI deploy, an operator, or an autoscaling policy - and
+without it the next apply would reset the count and silently undo a scale-out.
+So once images are pushed, start the tasks directly rather than through an
+apply:
 
 ```bash
-terraform apply -var app_desired_count=1
+for s in frontend backend mongodb; do
+  aws ecs update-service --cluster ecslab-fargate --service "ecslab-$s" --desired-count 1
+done
 ```
+
+`terraform apply -var app_desired_count=1` only takes effect on a service that
+does not exist yet - after a `destroy`, or for one newly added.
 
 `image_tag` (default `dev`) picks the tag, and `app_cpu_architecture` must match
 what the build produced - `docker compose build` on an x86 machine emits x86
